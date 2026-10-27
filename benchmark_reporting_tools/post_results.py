@@ -71,6 +71,10 @@ import httpx
 
 _LARGE_ASSET_DIRECT_UPLOAD_THRESHOLD_BYTES = 10 * 1024 * 1024
 
+# Written to the benchmark directory after a successful submission:
+# {benchmark_type: {<API response fields>, "url": <web UI URL of the run>}}
+POSTED_RUNS_FILE = "posted_runs.json"
+
 _ENGINE_TO_VARIANT = {
     "presto-velox-gpu": "gpu",
     "presto-velox-cpu": "cpu",
@@ -925,6 +929,7 @@ async def _process_benchmark_dir(
 
     # Process each benchmark type found in the result file.
     overall_result = 0
+    posted_runs: dict[str, dict] = {}
     for bench_name in benchmark_metadata.benchmark:
         print(f"\n  Processing benchmark type: {bench_name}", file=sys.stderr)
 
@@ -994,11 +999,32 @@ async def _process_benchmark_dir(
                 overall_result = 1
             else:
                 print(f"  Success: {response_text}", file=sys.stderr)
+                posted_runs[bench_name] = _describe_posted_run(api_url, response_text)
         except httpx.RequestError as e:
             print(f"  Error posting for '{bench_name}': {e}", file=sys.stderr)
             overall_result = 1
 
+    if posted_runs:
+        # Recorded so downstream reporting (e.g. the nightly Slack summary) can link to the runs.
+        posted_runs_file = benchmark_dir / POSTED_RUNS_FILE
+        posted_runs_file.write_text(json.dumps(posted_runs, indent=2) + "\n")
+        print(f"  Wrote {posted_runs_file}", file=sys.stderr)
+
     return overall_result
+
+
+def _describe_posted_run(api_url: str, response_text: str) -> dict:
+    """Return the submission response, plus the run's web UI URL when the response has a run ID."""
+    try:
+        response = json.loads(response_text)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(response, dict):
+        return {}
+    run_id = response.get("benchmark_run_id")
+    if run_id is not None:
+        response["url"] = f"{_normalize_api_url(api_url)}/runs/{run_id}/"
+    return response
 
 
 async def main() -> int:

@@ -12,7 +12,8 @@
 #   2. Runs a 1-node / 4-GPU TPC-H sf1000 benchmark.
 #   3. Runs a 2-node / 8-GPU TPC-H sf3000 benchmark.
 #   4. Posts results to the benchmarking DB via post_results.py.
-#   5. Removes the temporary images.
+#   5. Posts a summary (with links to the DB runs) to Slack, if SLACK_WEBHOOK_URL is set.
+#   6. Removes the temporary images.
 #
 # Required environment variables (no defaults — set before launching):
 #   SKU_NAME                  Hardware SKU name (--sku-name for post_results.py)
@@ -25,6 +26,9 @@
 # Optional environment variables:
 #   ITERATIONS      Number of benchmark iterations per run (default: 5)
 #   RUN_HOUR_UTC    Hour (UTC) at which to fire each night (default: 8, i.e. 3 AM EST)
+#   SLACK_WEBHOOK_URL
+#                   Slack incoming webhook to post the nightly summary to. When unset,
+#                   no Slack message is sent. Slack errors never fail the nightly run.
 #
 # Usage:
 #   export SKU_NAME="..."
@@ -32,6 +36,7 @@
 #   export STORAGE_CONFIG_3K="..."
 #   export BENCHMARK_API_URL="..."
 #   export BENCHMARK_API_KEY="..."
+#   export SLACK_WEBHOOK_URL="..."   # optional
 #   tmux new -s nightly-presto
 #   ./nightly-benchmark.sh
 #
@@ -151,6 +156,23 @@ post_results() {
         --label "nightly"
 }
 
+post_slack_summary() {
+    local note="${1:-}"
+    if [[ -z "${SLACK_WEBHOOK_URL:-}" ]]; then
+        echo "SLACK_WEBHOOK_URL not set — skipping Slack summary"
+        return 0
+    fi
+    local args=(
+        "${RESULTS_BASE}/nightly-${DATE_TAG}"
+        --run tpch-1k
+        --run tpch-3k
+        --note "Images: \`${COORD_TAG}\` · \`${WORKER_TAG}\`"
+    )
+    [[ -n "${note}" ]] && args+=(--note "${note}")
+    echo "Posting summary to Slack..."
+    python3 "${VT_ROOT}/benchmark_reporting_tools/post_slack_summary.py" "${args[@]}"
+}
+
 cleanup_images() {
     # IMAGE_DIR is on compute-node-only scratch storage on some clusters, so
     # run the deletion via srun to match how pull_ghcr_image.sh created the files.
@@ -164,12 +186,10 @@ cleanup_images() {
 }
 
 run_nightly() {
-    local date_tag
-    date_tag=$(date -u +%Y%m%d)
-    local output_1k="${RESULTS_BASE}/nightly-${date_tag}/tpch-1k"
-    local output_3k="${RESULTS_BASE}/nightly-${date_tag}/tpch-3k"
+    local output_1k="${RESULTS_BASE}/nightly-${DATE_TAG}/tpch-1k"
+    local output_3k="${RESULTS_BASE}/nightly-${DATE_TAG}/tpch-3k"
 
-    echo_success "=== Nightly benchmark starting: ${date_tag} ==="
+    echo_success "=== Nightly benchmark starting: ${DATE_TAG} ==="
     echo "  Coordinator image: ${REGISTRY}:${COORD_TAG}"
     echo "  Worker image:      ${REGISTRY}:${WORKER_TAG}"
     echo "  Iterations:        ${ITERATIONS}"
@@ -203,7 +223,10 @@ run_nightly() {
     fi
 
     echo ""
-    echo_success "=== Nightly benchmark complete: ${date_tag} ==="
+    post_slack_summary || echo_warning "Failed to post Slack summary"
+
+    echo ""
+    echo_success "=== Nightly benchmark complete: ${DATE_TAG} ==="
 }
 
 # run_isolated() isolates a function in a sub-shell with errexit (-e) such that any error
@@ -223,6 +246,8 @@ run_isolated() {
 
 warn_on_failure() {
     echo_warning "Nightly run FAILED (exit $1) — will retry tomorrow"
+    post_slack_summary ":rotating_light: Nightly run aborted (exit $1) — see \`${LOG_FILE}\` on $(hostname)" \
+        || echo_warning "Failed to post Slack summary"
 }
 
 # ------------------------------------------------------------------------------
@@ -232,5 +257,7 @@ trap 'cleanup_images || true; exit 130' INT TERM
 while true; do
     [[ "${RUN_NOW}" -eq 1 ]] || sleep_until_next_run
     RUN_NOW=0
+    # Global so that warn_on_failure (outside run_nightly's sub-shell) can find the results.
+    DATE_TAG=$(date -u +%Y%m%d)
     run_isolated run_nightly cleanup_images warn_on_failure
 done
