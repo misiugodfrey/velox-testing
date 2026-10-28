@@ -48,6 +48,11 @@ RESULT_FILE = "benchmark_result.json"
 # Written by post_results.py after a successful submission.
 POSTED_RUNS_FILE = "posted_runs.json"
 NIGHTLY_DIR_PATTERN = re.compile(r"^nightly-(\d{8})$")
+# Written by the slurm launcher to presto-tpch-run_*.out, e.g.
+#   "Starting Presto coordinator on presto-gb200-gcn-05..."
+#   "  Starting worker 7 on node presto-gb200-gcn-12 GPU 3"
+COORDINATOR_NODE_PATTERN = re.compile(r"Starting Presto coordinator on (\S+?)\.{0,3}\s*$", re.MULTILINE)
+WORKER_NODE_PATTERN = re.compile(r"Starting worker \d+ on node (\S+)")
 
 
 @dataclass
@@ -106,6 +111,33 @@ def load_posted_urls(run_dir: Path) -> list[str]:
     return [entry["url"] for entry in posted.values() if isinstance(entry, dict) and entry.get("url")]
 
 
+def load_nodes(run_dir: Path) -> tuple[str | None, list[str]]:
+    """Return (coordinator node, worker nodes in first-seen order) from the slurm job output in *run_dir*."""
+    coordinator = None
+    workers: list[str] = []
+    for out_file in sorted(run_dir.glob("presto-*.out")):
+        try:
+            text = out_file.read_text(errors="replace")
+        except OSError:
+            continue
+        match = COORDINATOR_NODE_PATTERN.search(text)
+        if match and coordinator is None:
+            coordinator = match.group(1)
+        for node in WORKER_NODE_PATTERN.findall(text):
+            if node not in workers:
+                workers.append(node)
+    return coordinator, workers
+
+
+def _fmt_nodes(coordinator: str | None, workers: list[str]) -> str | None:
+    nodes = list(workers)
+    if coordinator and coordinator not in nodes:
+        nodes.insert(0, coordinator)
+    if not nodes:
+        return None
+    return ", ".join(f"`{node}`" + (" (coordinator)" if node == coordinator else "") for node in nodes)
+
+
 def find_baseline(nightly_dir: Path, run_name: str) -> tuple[str, RunResult] | None:
     """Return (date, result) for the most recent nightly before *nightly_dir* with results for *run_name*."""
     match = NIGHTLY_DIR_PATTERN.match(nightly_dir.name)
@@ -162,6 +194,9 @@ def summarize_run(
     total_queries = len(result.query_times_ms) + len(result.failed_queries)
     status = "warn" if result.failed_queries or not urls else "ok"
     lines = [f"*{run_name}*{shape} · {db_link}"]
+    nodes = _fmt_nodes(*load_nodes(run_dir))
+    if nodes:
+        lines.append(f"Nodes: {nodes}")
 
     total_ms = sum(result.query_times_ms.values())
     total_line = f"Total: *{_fmt_seconds(total_ms)}* · {len(result.query_times_ms)}/{total_queries} queries passed"
