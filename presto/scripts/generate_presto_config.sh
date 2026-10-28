@@ -129,7 +129,8 @@ EOF
     sed -i "s+^use-mmap-allocator=.*+use-mmap-allocator=${USE_MMAP_ALLOCATOR}+g" "${CONFIG_DIR}/etc_worker/config_native.properties"
   fi
 
-  # Apply variant-specific override files by appending them to the generated configs
+  # Apply variant-specific override files to the generated configs. A "key=value" line replaces
+  # an existing "key=" line in place (so a key is never defined twice); anything else is appended.
   OVERRIDES_DIR="${SCRIPT_DIR}/../docker/config/template/overrides/${VARIANT_TYPE}"
   if [[ -d "${OVERRIDES_DIR}" ]]; then
     mapfile -d '' override_files < <(find "${OVERRIDES_DIR}" -type f -print0)
@@ -137,7 +138,14 @@ EOF
       rel_path="${src_file#${OVERRIDES_DIR}/}"
       dest_file="${CONFIG_DIR}/${rel_path}"
       if [[ -f "${dest_file}" ]]; then
-        cat "${src_file}" >> "${dest_file}"
+        while IFS= read -r line || [[ -n "${line}" ]]; do
+          if [[ "${line}" =~ ^([A-Za-z0-9._-]+)= ]] && grep -q "^${BASH_REMATCH[1]}=" "${dest_file}"; then
+            awk -v k="${BASH_REMATCH[1]}=" -v v="${line}" 'index($0, k) == 1 { print v; next } { print }' \
+              "${dest_file}" > "${dest_file}.tmp" && mv "${dest_file}.tmp" "${dest_file}"
+          else
+            echo "${line}" >> "${dest_file}"
+          fi
+        done < "${src_file}"
       fi
     done
   fi
